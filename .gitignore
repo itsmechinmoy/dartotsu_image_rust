@@ -1,0 +1,23 @@
+# Dart / Flutter
+.dart_tool/
+.packages
+build/
+
+# Rust / Cargo
+rust/target/
+rust/Cargo.lock
+
+# Android
+.gradle/
+local.properties
+*.apk
+
+# iOS / macOS
+Pods/
+.symlinks/
+*.xcworkspace
+
+# IDE
+.idea/
+*.iml
+.vscode/
