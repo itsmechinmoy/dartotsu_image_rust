@@ -128,14 +128,14 @@ pub extern "C" fn dartotsu_image_scale(
     }
 
     // Choose scaling algorithm
-    let filter = match algorithm {
-        0 => FilterType::Point,
-        1 => FilterType::Bilinear,
-        2 => FilterType::CatmullRom,
-        _ => FilterType::Lanczos3,
+    let resize_alg = match algorithm {
+        0 => ResizeAlg::Nearest,
+        1 => ResizeAlg::Convolution(FilterType::Bilinear),
+        2 => ResizeAlg::Convolution(FilterType::CatmullRom),
+        _ => ResizeAlg::Convolution(FilterType::Lanczos3),
     };
 
-    let options = ResizeOptions::new().resize_alg(ResizeAlg::Convolution(filter));
+    let options = ResizeOptions::new().resize_alg(resize_alg);
 
     // Convert source to RGBA8 for consistent SIMD processing
     let rgba_src = src_img.to_rgba8();
