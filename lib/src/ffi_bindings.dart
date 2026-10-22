@@ -1,108 +1,68 @@
 import 'dart:ffi' as ffi;
 import 'dart:io';
 
-typedef DartotsuVipsAvailableC = ffi.Int32 Function();
-typedef DartotsuVipsAvailableDart = int Function();
+import 'package:ffi/ffi.dart';
 
-typedef DartotsuImageScaleC = ffi.Int32 Function(
-  ffi.Pointer<ffi.Uint8> inputPtr,
-  ffi.Size inputLen,
-  ffi.Uint32 targetWidth,
-  ffi.Uint32 targetHeight,
-  ffi.Uint32 algorithm,
-  ffi.Uint32 outputFormat,
-  ffi.Pointer<ffi.Pointer<ffi.Uint8>> outPtr,
-  ffi.Pointer<ffi.Size> outLen,
-);
-typedef DartotsuImageScaleDart = int Function(
-  ffi.Pointer<ffi.Uint8> inputPtr,
-  int inputLen,
-  int targetWidth,
-  int targetHeight,
-  int algorithm,
-  int outputFormat,
-  ffi.Pointer<ffi.Pointer<ffi.Uint8>> outPtr,
-  ffi.Pointer<ffi.Size> outLen,
-);
+typedef _ScaleFileC =
+    ffi.Int32 Function(
+      ffi.Pointer<Utf8> path,
+      ffi.Uint32 maxWidth,
+      ffi.Uint32 maxHeight,
+      ffi.Uint32 algorithm,
+      ffi.Pointer<ffi.Pointer<ffi.Uint8>> outPtr,
+      ffi.Pointer<ffi.Size> outLen,
+      ffi.Pointer<ffi.Uint32> outWidth,
+      ffi.Pointer<ffi.Uint32> outHeight,
+    );
+typedef _ScaleFileDart =
+    int Function(
+      ffi.Pointer<Utf8> path,
+      int maxWidth,
+      int maxHeight,
+      int algorithm,
+      ffi.Pointer<ffi.Pointer<ffi.Uint8>> outPtr,
+      ffi.Pointer<ffi.Size> outLen,
+      ffi.Pointer<ffi.Uint32> outWidth,
+      ffi.Pointer<ffi.Uint32> outHeight,
+    );
 
-typedef DartotsuImageFreeC = ffi.Void Function(
-  ffi.Pointer<ffi.Uint8> ptr,
-  ffi.Size len,
-);
-typedef DartotsuImageFreeDart = void Function(
-  ffi.Pointer<ffi.Uint8> ptr,
-  int len,
-);
-
-typedef DartotsuImageDetectBordersC = ffi.Int32 Function(
-  ffi.Pointer<ffi.Uint8> inputPtr,
-  ffi.Size inputLen,
-  ffi.Pointer<ffi.Double> outLeft,
-  ffi.Pointer<ffi.Double> outTop,
-  ffi.Pointer<ffi.Double> outRight,
-  ffi.Pointer<ffi.Double> outBottom,
-);
-typedef DartotsuImageDetectBordersDart = int Function(
-  ffi.Pointer<ffi.Uint8> inputPtr,
-  int inputLen,
-  ffi.Pointer<ffi.Double> outLeft,
-  ffi.Pointer<ffi.Double> outTop,
-  ffi.Pointer<ffi.Double> outRight,
-  ffi.Pointer<ffi.Double> outBottom,
-);
+typedef _FreeC = ffi.Void Function(ffi.Pointer<ffi.Uint8> buffer, ffi.Size len);
+typedef _FreeDart = void Function(ffi.Pointer<ffi.Uint8> buffer, int len);
 
 class DartotsuRustBindings {
+  static const ok = 0;
+  static const unchanged = 1;
+
+  final _ScaleFileDart scaleFile;
+  final _FreeDart free;
+
+  DartotsuRustBindings._(ffi.DynamicLibrary lib)
+    : scaleFile = lib
+          .lookup<ffi.NativeFunction<_ScaleFileC>>('dartotsu_image_scale_file')
+          .asFunction<_ScaleFileDart>(),
+      free = lib
+          .lookup<ffi.NativeFunction<_FreeC>>('dartotsu_image_free')
+          .asFunction<_FreeDart>();
+
   static DartotsuRustBindings? _instance;
-  static bool _initAttempted = false;
-
-  final ffi.DynamicLibrary library;
-  late final DartotsuVipsAvailableDart vipsAvailable;
-  late final DartotsuImageScaleDart imageScale;
-  late final DartotsuImageFreeDart imageFree;
-  late final DartotsuImageDetectBordersDart detectBorders;
-
-  DartotsuRustBindings._(this.library) {
-    vipsAvailable = library
-        .lookup<ffi.NativeFunction<DartotsuVipsAvailableC>>(
-          'dartotsu_vips_available',
-        )
-        .asFunction<DartotsuVipsAvailableDart>();
-
-    imageScale = library
-        .lookup<ffi.NativeFunction<DartotsuImageScaleC>>('dartotsu_image_scale')
-        .asFunction<DartotsuImageScaleDart>();
-
-    imageFree = library
-        .lookup<ffi.NativeFunction<DartotsuImageFreeC>>('dartotsu_image_free')
-        .asFunction<DartotsuImageFreeDart>();
-
-    detectBorders = library
-        .lookup<ffi.NativeFunction<DartotsuImageDetectBordersC>>(
-          'dartotsu_image_detect_borders',
-        )
-        .asFunction<DartotsuImageDetectBordersDart>();
-  }
+  static bool _tried = false;
 
   static DartotsuRustBindings? get instance {
-    if (_instance != null) return _instance;
-    if (_initAttempted) return null;
-    _initAttempted = true;
-
+    if (_instance != null || _tried) return _instance;
+    _tried = true;
     try {
-      final ffi.DynamicLibrary lib;
-      if (Platform.isAndroid || Platform.isLinux) {
-        lib = ffi.DynamicLibrary.open('libdartotsu_image_rust.so');
-      } else if (Platform.isWindows) {
-        lib = ffi.DynamicLibrary.open('dartotsu_image_rust.dll');
-      } else if (Platform.isIOS || Platform.isMacOS) {
-        lib = ffi.DynamicLibrary.process();
-      } else {
-        return null;
-      }
-      _instance = DartotsuRustBindings._(lib);
-      return _instance;
+      final lib = switch (Platform.operatingSystem) {
+        'android' || 'linux' => ffi.DynamicLibrary.open(
+          'libdartotsu_image_rust.so',
+        ),
+        'windows' => ffi.DynamicLibrary.open('dartotsu_image_rust.dll'),
+        'ios' || 'macos' => ffi.DynamicLibrary.process(),
+        _ => null,
+      };
+      if (lib != null) _instance = DartotsuRustBindings._(lib);
     } catch (_) {
-      return null;
+      _instance = null;
     }
+    return _instance;
   }
 }

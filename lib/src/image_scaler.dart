@@ -1,198 +1,206 @@
+import 'dart:async';
+import 'dart:collection';
 import 'dart:ffi' as ffi;
 import 'dart:isolate';
 import 'dart:typed_data';
+
 import 'package:ffi/ffi.dart';
 
 import 'ffi_bindings.dart';
 
-enum DartotsuScaleAlgorithm {
-  nearest(0),
-  bilinear(1),
-  bicubic(2),
-  lanczos(3);
+enum DartotsuScaleAlgorithm { nearest, bilinear, bicubic, lanczos }
 
-  final int value;
-  const DartotsuScaleAlgorithm(this.value);
+class ScaledPixels {
+  final Uint8List rgba;
+  final int width;
+  final int height;
+
+  const ScaledPixels(this.rgba, this.width, this.height);
 }
 
-class ScaledBorderRect {
-  final double left;
-  final double top;
-  final double right;
-  final double bottom;
+class ScaleTicket {
+  final Future<ScaledPixels?> result;
+  final void Function() _cancel;
 
-  const ScaledBorderRect({
-    required this.left,
-    required this.top,
-    required this.right,
-    required this.bottom,
+  ScaleTicket._(this.result, this._cancel);
+
+  void cancel() => _cancel();
+}
+
+class _Request {
+  final int id;
+  final String path;
+  final int maxWidth;
+  final int maxHeight;
+  final int algorithm;
+
+  const _Request(this.id, this.path, this.maxWidth, this.maxHeight, this.algorithm);
+}
+
+class _Response {
+  final int id;
+  final TransferableTypedData? pixels;
+  final int width;
+  final int height;
+
+  const _Response(this.id, this.pixels, this.width, this.height);
+}
+
+void _workerMain(SendPort parent) {
+  final inbox = ReceivePort();
+  parent.send(inbox.sendPort);
+  final bindings = DartotsuRustBindings.instance;
+  inbox.listen((message) {
+    final request = message as _Request;
+    parent.send(_run(bindings, request));
   });
-
-  double get width => right - left;
-  double get height => bottom - top;
 }
 
-/// In-memory LRU cache for Lanczos scaled images.
-class LanczosMemoryCache {
-  static final _map = <String, Uint8List>{};
-  static const int _maxEntries = 80;
+_Response _run(DartotsuRustBindings? bindings, _Request r) {
+  if (bindings == null) return _Response(r.id, null, 0, 0);
+  final path = r.path.toNativeUtf8();
+  final outPtr = malloc<ffi.Pointer<ffi.Uint8>>();
+  final outLen = malloc<ffi.Size>();
+  final outW = malloc<ffi.Uint32>();
+  final outH = malloc<ffi.Uint32>();
+  try {
+    final code = bindings.scaleFile(
+      path,
+      r.maxWidth,
+      r.maxHeight,
+      r.algorithm,
+      outPtr,
+      outLen,
+      outW,
+      outH,
+    );
+    if (code != DartotsuRustBindings.ok) return _Response(r.id, null, 0, 0);
+    final buffer = outPtr.value;
+    final len = outLen.value;
+    final data = TransferableTypedData.fromList([buffer.asTypedList(len)]);
+    bindings.free(buffer, len);
+    return _Response(r.id, data, outW.value, outH.value);
+  } finally {
+    malloc.free(path);
+    malloc.free(outPtr);
+    malloc.free(outLen);
+    malloc.free(outW);
+    malloc.free(outH);
+  }
+}
 
-  static Uint8List? get(String key) => _map[key];
+class _Worker {
+  final SendPort port;
+  int? busyWith;
 
-  static void put(String key, Uint8List bytes) {
-    _map.remove(key);
-    _map[key] = bytes;
-    if (_map.length > _maxEntries) {
-      _map.remove(_map.keys.first);
-    }
+  _Worker(this.port);
+}
+
+class _Job {
+  final _Request request;
+  final Completer<ScaledPixels?> done = Completer();
+  bool cancelled = false;
+
+  _Job(this.request);
+}
+
+class _Pool {
+  static const _maxWorkers = 2;
+
+  final _queue = Queue<_Job>();
+  final _running = <int, _Job>{};
+  final _workers = <_Worker>[];
+  final _inbox = ReceivePort();
+  var _spawning = 0;
+  var _nextId = 0;
+
+  _Pool() {
+    _inbox.listen(_onMessage);
   }
 
-  static void clear() {
-    _map.clear();
+  void _onMessage(dynamic message) {
+    if (message is SendPort) {
+      _spawning--;
+      _workers.add(_Worker(message));
+      _pump();
+      return;
+    }
+    final response = message as _Response;
+    final job = _running.remove(response.id);
+    for (final w in _workers) {
+      if (w.busyWith == response.id) w.busyWith = null;
+    }
+    if (job != null && !job.done.isCompleted) {
+      final data = response.pixels;
+      job.done.complete(
+        job.cancelled || data == null
+            ? null
+            : ScaledPixels(
+                data.materialize().asUint8List(),
+                response.width,
+                response.height,
+              ),
+      );
+    }
+    _pump();
+  }
+
+  ScaleTicket submit(String path, int maxW, int maxH, int algorithm) {
+    final job = _Job(_Request(_nextId++, path, maxW, maxH, algorithm));
+    _queue.add(job);
+    _pump();
+    return ScaleTicket._(job.done.future, () {
+      job.cancelled = true;
+      if (_queue.remove(job) && !job.done.isCompleted) job.done.complete(null);
+    });
+  }
+
+  void _pump() {
+    while (_queue.isNotEmpty) {
+      _Worker? free;
+      for (final w in _workers) {
+        if (w.busyWith == null) {
+          free = w;
+          break;
+        }
+      }
+      if (free == null) {
+        if (_workers.length + _spawning < _maxWorkers) {
+          _spawning++;
+          Isolate.spawn(_workerMain, _inbox.sendPort).catchError((Object _) {
+            _spawning--;
+            while (_queue.isNotEmpty) {
+              _queue.removeFirst().done.complete(null);
+            }
+            return Isolate.current;
+          });
+        }
+        return;
+      }
+      final job = _queue.removeFirst();
+      if (job.cancelled) continue;
+      free.busyWith = job.request.id;
+      _running[job.request.id] = job;
+      free.port.send(job.request);
+    }
   }
 }
 
 class DartotsuImageRust {
   DartotsuImageRust._();
 
+  static final _pool = _Pool();
+
   static bool get isSupported => DartotsuRustBindings.instance != null;
 
-  static bool get isVipsAvailable {
-    final bindings = DartotsuRustBindings.instance;
-    return bindings != null && bindings.vipsAvailable() == 1;
-  }
-
-  /// Scale an encoded image buffer using the selected algorithm (defaulting to Lanczos3).
-  ///
-  /// Runs off the main thread inside an isolate.
-  static Future<Uint8List?> scale({
-    required Uint8List bytes,
-    required int targetWidth,
-    required int targetHeight,
+  /// Scales the image file at [path] down to fit inside [maxWidth] x
+  /// [maxHeight] (0 leaves that axis unbounded). The result is RGBA8 pixels,
+  /// or null when the image already fits, cannot be decoded, or the native
+  /// library is missing.
+  static ScaleTicket scale(
+    String path, {
+    int maxWidth = 0,
+    int maxHeight = 0,
     DartotsuScaleAlgorithm algorithm = DartotsuScaleAlgorithm.lanczos,
-    bool png = false,
-    String? cacheKey,
-  }) async {
-    if (bytes.isEmpty) return null;
-
-    if (cacheKey != null) {
-      final cached = LanczosMemoryCache.get(cacheKey);
-      if (cached != null) return cached;
-    }
-
-    if (!isSupported) return null;
-
-    try {
-      final result = await Isolate.run(() {
-        return _scaleSync(
-          bytes: bytes,
-          targetWidth: targetWidth,
-          targetHeight: targetHeight,
-          algorithm: algorithm.value,
-          outputFormat: png ? 1 : 0,
-        );
-      });
-
-      if (result != null && cacheKey != null) {
-        LanczosMemoryCache.put(cacheKey, result);
-      }
-      return result;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  /// Synchronous native FFI scaling inside isolate.
-  static Uint8List? _scaleSync({
-    required Uint8List bytes,
-    required int targetWidth,
-    required int targetHeight,
-    required int algorithm,
-    required int outputFormat,
-  }) {
-    final bindings = DartotsuRustBindings.instance;
-    if (bindings == null) return null;
-
-    final inputPtr = calloc<ffi.Uint8>(bytes.length);
-    final outPtr = calloc<ffi.Pointer<ffi.Uint8>>();
-    final outLen = calloc<ffi.Size>();
-
-    try {
-      inputPtr.asTypedList(bytes.length).setAll(0, bytes);
-
-      final status = bindings.imageScale(
-        inputPtr,
-        bytes.length,
-        targetWidth,
-        targetHeight,
-        algorithm,
-        outputFormat,
-        outPtr,
-        outLen,
-      );
-
-      if (status != 0 || outPtr.value.address == 0 || outLen.value == 0) {
-        return null;
-      }
-
-      final resultBytes = Uint8List.fromList(
-        outPtr.value.asTypedList(outLen.value),
-      );
-
-      bindings.imageFree(outPtr.value, outLen.value);
-      return resultBytes;
-    } finally {
-      calloc.free(inputPtr);
-      calloc.free(outPtr);
-      calloc.free(outLen);
-    }
-  }
-
-  /// Accelerated border margin detection.
-  static Future<ScaledBorderRect?> detectBorders(Uint8List bytes) async {
-    if (!isSupported || bytes.isEmpty) return null;
-
-    try {
-      return await Isolate.run(() {
-        final bindings = DartotsuRustBindings.instance;
-        if (bindings == null) return null;
-
-        final inputPtr = calloc<ffi.Uint8>(bytes.length);
-        final outL = calloc<ffi.Double>();
-        final outT = calloc<ffi.Double>();
-        final outR = calloc<ffi.Double>();
-        final outB = calloc<ffi.Double>();
-
-        try {
-          inputPtr.asTypedList(bytes.length).setAll(0, bytes);
-
-          final res = bindings.detectBorders(
-            inputPtr,
-            bytes.length,
-            outL,
-            outT,
-            outR,
-            outB,
-          );
-
-          if (res != 0) return null;
-
-          return ScaledBorderRect(
-            left: outL.value,
-            top: outT.value,
-            right: outR.value,
-            bottom: outB.value,
-          );
-        } finally {
-          calloc.free(inputPtr);
-          calloc.free(outL);
-          calloc.free(outT);
-          calloc.free(outR);
-          calloc.free(outB);
-        }
-      });
-    } catch (_) {
-      return null;
-    }
-  }
+  }) => _pool.submit(path, maxWidth, maxHeight, algorithm.index);
 }

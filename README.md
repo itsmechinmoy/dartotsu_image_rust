@@ -1,15 +1,13 @@
 # dartotsu_image_rust
 
-High-performance Rust & SIMD image processing Flutter plugin for Dartotsu (Lanczos3, Bicubic, Bilinear, Nearest Neighbor, and optional libvips).
+Downscales images with SIMD Lanczos3 / bicubic / bilinear / nearest filtering
+(`fast_image_resize`) through a small Rust FFI library built by Cargokit.
 
-## Features
-- **SIMD Resampling**: Powered by `fast_image_resize` (ARM NEON & x86 AVX2) and `rayon` for multi-threaded CPU scaling.
-- **Multiple Resampling Filters**: Lanczos3, Bicubic (Catmull-Rom), Bilinear, Nearest Neighbor.
-- **Rich Format Decoding**: Decodes PNG, JPEG, WebP, AVIF, GIF, BMP, TIFF, ICO, QOI, TGA, and HDR.
-- **libvips Ready**: Optional feature-flagged libvips binding support.
-- **Cross-Platform**: Android, iOS, macOS, Windows, Linux via Cargokit.
-
-## Usage
+- Reads the file itself, so no image bytes are copied through Dart.
+- Skips decoding entirely when the image already fits the target size.
+- Returns raw RGBA pixels that Flutter decodes without an encode step.
+- Two persistent worker isolates; queued work can be cancelled.
+- Decodes PNG, JPEG, WebP, GIF and BMP. Corrupt files return an error instead of crashing.
 
 ```yaml
 dependencies:
@@ -20,12 +18,12 @@ dependencies:
 ```
 
 ```dart
-import 'package:dartotsu_image_rust/dartotsu_image_rust.dart';
-
-final scaledBytes = await DartotsuImageRust.scale(
-  sourceBytes: imageBytes,
-  targetWidth: 1080,
-  targetHeight: 1920,
-  filter: RustImageFilter.lanczos3,
+final provider = DartotsuScaledImage(
+  id: page.url,
+  loadFile: () async => File(path),
+  maxWidth: 1080,
 );
 ```
+
+`DartotsuScaledImage` falls back to a normal decode when the image already fits,
+the native library is unavailable or scaling fails.

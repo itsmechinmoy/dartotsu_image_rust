@@ -1,6 +1,6 @@
 name: dartotsu_image_rust
-description: High-performance Rust & SIMD image processing plugin for Dartotsu (Lanczos, Bicubic, libvips).
-version: 0.1.0
+description: High-performance Rust & SIMD image processing plugin for Dartotsu.
+version: 0.2.0
 publish_to: 'none'
 
 environment:
