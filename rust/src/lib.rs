@@ -1,324 +1,229 @@
 use fast_image_resize::images::Image;
-use fast_image_resize::{FilterType, IntoImageView, ResizeAlg, ResizeOptions, Resizer};
-use image::{DynamicImage, GenericImageView, ImageFormat, ImageReader};
-use std::io::Cursor;
-use std::slice;
+use fast_image_resize::{FilterType, PixelType, ResizeAlg, ResizeOptions, Resizer};
+use image::{DynamicImage, ImageDecoder, ImageReader};
+use std::ffi::CStr;
+use std::os::raw::c_char;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::{fs, ptr};
 
-#[cfg(feature = "vips")]
-use vips::*;
+const MAX_SIDE: u32 = 20_000;
+const MAX_PIXELS: u64 = 120_000_000;
 
-/// Returns 1 if compiled with libvips support, 0 otherwise.
-#[no_mangle]
-pub extern "C" fn dartotsu_vips_available() -> i32 {
-    #[cfg(feature = "vips")]
-    {
-        1
-    }
-    #[cfg(not(feature = "vips"))]
-    {
-        0
-    }
+pub const OK: i32 = 0;
+pub const UNCHANGED: i32 = 1;
+pub const ERR_ARGS: i32 = -1;
+pub const ERR_READ: i32 = -2;
+pub const ERR_DECODE: i32 = -3;
+pub const ERR_SIZE: i32 = -4;
+pub const ERR_RESIZE: i32 = -5;
+pub const ERR_PANIC: i32 = -9;
+
+struct Scaled {
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
 }
 
-#[cfg(feature = "vips")]
-fn scale_with_vips(
-    input_bytes: &[u8],
-    target_width: u32,
-    target_height: u32,
-    output_format: u32,
-) -> Option<Vec<u8>> {
-    let img = VipsImage::from_buffer(input_bytes).ok()?;
-    let tw = if target_width > 0 { target_width } else { img.width() as u32 };
-    let th = if target_height > 0 { target_height } else { img.height() as u32 };
-    let resized = img.thumbnail(tw, th, VipsSize::VIPS_SIZE_BOTH).ok()?;
-    let suffix = if output_format == 1 { ".png" } else { ".jpg[Q=92]" };
-    resized.write_to_buffer(suffix).ok()
+fn fitted(src_w: u32, src_h: u32, max_w: u32, max_h: u32) -> Option<(u32, u32)> {
+    let scale = match (max_w, max_h) {
+        (0, 0) => return None,
+        (w, 0) => w as f64 / src_w as f64,
+        (0, h) => h as f64 / src_h as f64,
+        (w, h) => (w as f64 / src_w as f64).min(h as f64 / src_h as f64),
+    };
+    if scale >= 1.0 {
+        return None;
+    }
+    let w = ((src_w as f64 * scale).round() as u32).max(1);
+    let h = ((src_h as f64 * scale).round() as u32).max(1);
+    Some((w, h))
 }
 
-/// Resizes an encoded image buffer using SIMD acceleration or libvips.
-///
-/// Supported Input Formats:
-/// - Modern: AVIF, WebP, PNG, JPEG, GIF, BMP, TIFF, ICO, QOI, TGA, HDR
-/// - Extended (via libvips): JXL, HEIC/HEIF, SVG, PSD, PDF, Camera RAW (DNG, CR2, NEF, ARW)
-///
-/// Algorithm:
-/// - 0: Point / Nearest Neighbor
-/// - 1: Bilinear
-/// - 2: CatmullRom / Bicubic
-/// - 3: Lanczos3
-///
-/// Output Format:
-/// - 0: JPEG (high quality, 92)
-/// - 1: PNG (lossless)
-///
-/// Returns 0 on success, negative error code on failure.
-#[no_mangle]
-pub extern "C" fn dartotsu_image_scale(
-    input_ptr: *const u8,
-    input_len: usize,
-    mut target_width: u32,
-    mut target_height: u32,
-    algorithm: u32,
-    output_format: u32,
-    out_ptr: *mut *mut u8,
-    out_len: *mut usize,
-) -> i32 {
-    if input_ptr.is_null() || input_len == 0 || out_ptr.is_null() || out_len.is_null() {
-        return -1; // Invalid arguments
-    }
-
-    let input_bytes = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-
-    // Decode source image using the comprehensive image-rs format decoders
-    let reader = match ImageReader::new(Cursor::new(input_bytes)).with_guessed_format() {
-        Ok(r) => r,
-        Err(_) => {
-            #[cfg(feature = "vips")]
-            {
-                if let Some(mut buf) = scale_with_vips(input_bytes, target_width, target_height, output_format) {
-                    buf.shrink_to_fit();
-                    let len = buf.len();
-                    let ptr = buf.as_mut_ptr();
-                    std::mem::forget(buf);
-                    unsafe {
-                        *out_ptr = ptr;
-                        *out_len = len;
-                    }
-                    return 0;
-                }
-            }
-            return -2; // Format guess failed
-        }
-    };
-
-    let src_img = match reader.decode() {
-        Ok(img) => img,
-        Err(_) => {
-            #[cfg(feature = "vips")]
-            {
-                if let Some(mut buf) = scale_with_vips(input_bytes, target_width, target_height, output_format) {
-                    buf.shrink_to_fit();
-                    let len = buf.len();
-                    let ptr = buf.as_mut_ptr();
-                    std::mem::forget(buf);
-                    unsafe {
-                        *out_ptr = ptr;
-                        *out_len = len;
-                    }
-                    return 0;
-                }
-            }
-            return -3; // Decoding failed
-        }
-    };
-
-    let (src_width, src_height) = src_img.dimensions();
-    if src_width == 0 || src_height == 0 {
-        return -4;
-    }
-
-    // Maintain aspect ratio if one dimension is 0
-    if target_width == 0 && target_height == 0 {
-        target_width = src_width;
-        target_height = src_height;
-    } else if target_width == 0 {
-        target_width = ((src_width as u64 * target_height as u64) / src_height as u64).max(1) as u32;
-    } else if target_height == 0 {
-        target_height = ((src_height as u64 * target_width as u64) / src_width as u64).max(1) as u32;
-    }
-
-    // Choose scaling algorithm
-    let resize_alg = match algorithm {
+fn algorithm(id: u32) -> ResizeAlg {
+    match id {
         0 => ResizeAlg::Nearest,
         1 => ResizeAlg::Convolution(FilterType::Bilinear),
         2 => ResizeAlg::Convolution(FilterType::CatmullRom),
         _ => ResizeAlg::Convolution(FilterType::Lanczos3),
-    };
-
-    let options = ResizeOptions::new().resize_alg(resize_alg);
-
-    // Convert source to RGBA8 for consistent SIMD processing
-    let rgba_src = src_img.to_rgba8();
-    let src_view = match rgba_src.pixel_type() {
-        Some(pt) => match Image::from_vec_u8(src_width, src_height, rgba_src.into_raw(), pt) {
-            Ok(img) => img,
-            Err(_) => return -5,
-        },
-        None => return -5,
-    };
-
-    let pixel_type = src_view.pixel_type();
-    let mut dst_image = Image::new(target_width, target_height, pixel_type);
-
-    let mut resizer = Resizer::new();
-    if resizer.resize(&src_view, &mut dst_image, &options).is_err() {
-        return -6; // Resize failed
-    }
-
-    // Wrap destination into DynamicImage for encoding
-    let dst_rgba = dst_image.into_vec();
-    let dst_dyn = match image::RgbaImage::from_raw(target_width, target_height, dst_rgba) {
-        Some(img) => DynamicImage::ImageRgba8(img),
-        None => return -7,
-    };
-
-    // Encode to output buffer
-    let mut out_buffer = Vec::new();
-    let encode_result = if output_format == 1 {
-        dst_dyn.write_to(&mut Cursor::new(&mut out_buffer), ImageFormat::Png)
-    } else {
-        let mut jpeg_encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out_buffer, 92);
-        jpeg_encoder.encode_image(&dst_dyn)
-    };
-
-    if encode_result.is_err() {
-        return -8; // Encoding failed
-    }
-
-    out_buffer.shrink_to_fit();
-    let len = out_buffer.len();
-    let ptr = out_buffer.as_mut_ptr();
-    std::mem::forget(out_buffer);
-
-    unsafe {
-        *out_ptr = ptr;
-        *out_len = len;
-    }
-
-    0 // Success
-}
-
-/// Frees a buffer previously allocated by `dartotsu_image_scale`.
-#[no_mangle]
-pub extern "C" fn dartotsu_image_free(ptr: *mut u8, len: usize) {
-    if !ptr.is_null() && len > 0 {
-        unsafe {
-            let _ = Vec::from_raw_parts(ptr, len, len);
-        }
     }
 }
 
-/// Fast border crop detection (accelerated detection of blank margins).
+fn scale_bytes(bytes: &[u8], max_w: u32, max_h: u32, alg: u32) -> Result<Option<Scaled>, i32> {
+    let reader = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|_| ERR_DECODE)?;
+    let decoder = reader.into_decoder().map_err(|_| ERR_DECODE)?;
+    let (src_w, src_h) = decoder.dimensions();
+    if src_w == 0 || src_h == 0 || src_w > MAX_SIDE || src_h > MAX_SIDE {
+        return Err(ERR_SIZE);
+    }
+    if src_w as u64 * src_h as u64 > MAX_PIXELS {
+        return Err(ERR_SIZE);
+    }
+    let Some((dst_w, dst_h)) = fitted(src_w, src_h, max_w, max_h) else {
+        return Ok(None);
+    };
+
+    let decoded = DynamicImage::from_decoder(decoder).map_err(|_| ERR_DECODE)?;
+    let has_alpha = decoded.color().has_alpha();
+    let src = Image::from_vec_u8(src_w, src_h, decoded.into_rgba8().into_raw(), PixelType::U8x4)
+        .map_err(|_| ERR_DECODE)?;
+    let mut dst = Image::new(dst_w, dst_h, PixelType::U8x4);
+
+    let options = ResizeOptions::new()
+        .resize_alg(algorithm(alg))
+        .use_alpha(has_alpha);
+    Resizer::new()
+        .resize(&src, &mut dst, &options)
+        .map_err(|_| ERR_RESIZE)?;
+
+    Ok(Some(Scaled {
+        pixels: dst.into_vec(),
+        width: dst_w,
+        height: dst_h,
+    }))
+}
+
+/// Scales the image file at `path` down to fit inside `max_width` x `max_height`
+/// (0 = unbounded on that axis) and writes RGBA8 pixels to `out_ptr`.
+///
+/// Returns `UNCHANGED` (1) without decoding when the image already fits, `OK` (0)
+/// on success, a negative error code otherwise. Free the buffer with
+/// `dartotsu_image_free`.
 #[no_mangle]
-pub extern "C" fn dartotsu_image_detect_borders(
-    input_ptr: *const u8,
-    input_len: usize,
-    out_left: *mut f64,
-    out_top: *mut f64,
-    out_right: *mut f64,
-    out_bottom: *mut f64,
+pub extern "C" fn dartotsu_image_scale_file(
+    path: *const c_char,
+    max_width: u32,
+    max_height: u32,
+    algorithm: u32,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+    out_width: *mut u32,
+    out_height: *mut u32,
 ) -> i32 {
-    if input_ptr.is_null() || input_len == 0 {
-        return -1;
+    if path.is_null()
+        || out_ptr.is_null()
+        || out_len.is_null()
+        || out_width.is_null()
+        || out_height.is_null()
+    {
+        return ERR_ARGS;
     }
-
-    let input_bytes = unsafe { slice::from_raw_parts(input_ptr, input_len) };
-    let reader = match ImageReader::new(Cursor::new(input_bytes)).with_guessed_format() {
-        Ok(r) => r,
-        Err(_) => return -2,
-    };
-
-    let img = match reader.decode() {
-        Ok(img) => img,
-        Err(_) => return -3,
-    };
-
-    let (w, h) = img.dimensions();
-    if w < 16 || h < 16 {
-        return -4;
-    }
-
-    let gray = img.to_luma8();
-    let pixels = gray.as_raw();
-
-    let is_blank = |min: u8, max: u8, sum: u64, count: u64| -> bool {
-        if max.saturating_sub(min) > 14 {
-            return false;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let path = unsafe { CStr::from_ptr(path) }
+            .to_str()
+            .map_err(|_| ERR_ARGS)?;
+        let bytes = fs::read(path).map_err(|_| ERR_READ)?;
+        scale_bytes(&bytes, max_width, max_height, algorithm)
+    }));
+    match result {
+        Err(_) => ERR_PANIC,
+        Ok(Err(code)) => code,
+        Ok(Ok(None)) => UNCHANGED,
+        Ok(Ok(Some(scaled))) => {
+            let boxed = scaled.pixels.into_boxed_slice();
+            let len = boxed.len();
+            unsafe {
+                *out_ptr = Box::into_raw(boxed) as *mut u8;
+                *out_len = len;
+                *out_width = scaled.width;
+                *out_height = scaled.height;
+            }
+            OK
         }
-        let mean = sum / count;
-        mean >= 232 || mean <= 22
-    };
-
-    let row_blank = |y: u32| -> bool {
-        let mut min = 255u8;
-        let mut max = 0u8;
-        let mut sum = 0u64;
-        let offset = (y * w) as usize;
-        for x in 0..w as usize {
-            let v = pixels[offset + x];
-            if v < min {
-                min = v;
-            }
-            if v > max {
-                max = v;
-            }
-            sum += v as u64;
-        }
-        is_blank(min, max, sum, w as u64)
-    };
-
-    let mut top = 0u32;
-    let max_v = (h as f64 * 0.4) as u32;
-    while top < max_v && row_blank(top) {
-        top += 1;
     }
+}
 
-    let mut bottom = 0u32;
-    while bottom < max_v && row_blank(h - 1 - bottom) {
-        bottom += 1;
+/// Frees a buffer returned by `dartotsu_image_scale_file`.
+#[no_mangle]
+pub extern "C" fn dartotsu_image_free(buffer: *mut u8, len: usize) {
+    if buffer.is_null() || len == 0 {
+        return;
     }
-
-    if top >= max_v || bottom >= max_v {
-        return 1; // No trim (too large)
-    }
-
-    let col_blank = |x: u32| -> bool {
-        let mut min = 255u8;
-        let mut max = 0u8;
-        let mut sum = 0u64;
-        let active_h = (h - top - bottom) as u64;
-        for y in top..(h - bottom) {
-            let v = pixels[(y * w + x) as usize];
-            if v < min {
-                min = v;
-            }
-            if v > max {
-                max = v;
-            }
-            sum += v as u64;
-        }
-        is_blank(min, max, sum, active_h)
-    };
-
-    let mut left = 0u32;
-    let max_h = (w as f64 * 0.4) as u32;
-    while left < max_h && col_blank(left) {
-        left += 1;
-    }
-
-    let mut right = 0u32;
-    while right < max_h && col_blank(w - 1 - right) {
-        right += 1;
-    }
-
-    if left >= max_h || right >= max_h {
-        return 1; // No trim
-    }
-
     unsafe {
-        if !out_left.is_null() {
-            *out_left = left as f64 / w as f64;
-        }
-        if !out_top.is_null() {
-            *out_top = top as f64 / h as f64;
-        }
-        if !out_right.is_null() {
-            *out_right = 1.0 - (right as f64 / w as f64);
-        }
-        if !out_bottom.is_null() {
-            *out_bottom = 1.0 - (bottom as f64 / h as f64);
+        drop(Box::from_raw(ptr::slice_from_raw_parts_mut(buffer, len)));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use image::{ImageFormat, Rgb, RgbImage};
+    use std::io::Cursor;
+
+    fn jpeg(w: u32, h: u32) -> Vec<u8> {
+        let img = RgbImage::from_fn(w, h, |x, y| Rgb([(x % 256) as u8, (y % 256) as u8, 128]));
+        let mut out = Vec::new();
+        DynamicImage::ImageRgb8(img)
+            .write_to(&mut Cursor::new(&mut out), ImageFormat::Jpeg)
+            .unwrap();
+        out
+    }
+
+    #[test]
+    fn fits_width_keeping_aspect() {
+        let s = scale_bytes(&jpeg(800, 1200), 400, 0, 3).unwrap().unwrap();
+        assert_eq!((s.width, s.height), (400, 600));
+        assert_eq!(s.pixels.len(), 400 * 600 * 4);
+    }
+
+    #[test]
+    fn fits_inside_box() {
+        let s = scale_bytes(&jpeg(1000, 500), 500, 100, 2).unwrap().unwrap();
+        assert_eq!((s.width, s.height), (200, 100));
+    }
+
+    #[test]
+    fn never_upscales() {
+        assert!(scale_bytes(&jpeg(300, 300), 600, 0, 3).unwrap().is_none());
+        assert!(scale_bytes(&jpeg(300, 300), 300, 300, 3).unwrap().is_none());
+        assert!(scale_bytes(&jpeg(300, 300), 0, 0, 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn every_algorithm_works() {
+        let data = jpeg(200, 200);
+        for alg in 0..4 {
+            let s = scale_bytes(&data, 100, 0, alg).unwrap().unwrap();
+            assert_eq!((s.width, s.height), (100, 100));
         }
     }
 
-    0 // Success
+    #[test]
+    fn garbage_is_an_error_not_a_panic() {
+        assert!(scale_bytes(&[1, 2, 3, 4, 5], 100, 0, 3).is_err());
+        let mut truncated = jpeg(400, 400);
+        truncated.truncate(truncated.len() / 3);
+        let _ = scale_bytes(&truncated, 100, 0, 3);
+    }
+
+    #[test]
+    fn tiny_image_is_unchanged() {
+        let mut out = Vec::new();
+        let img = image::GrayImage::new(1, 1);
+        DynamicImage::ImageLuma8(img)
+            .write_to(&mut Cursor::new(&mut out), ImageFormat::Png)
+            .unwrap();
+        assert!(scale_bytes(&out, 1, 0, 3).unwrap().is_none());
+    }
+
+    #[test]
+    fn ffi_round_trip() {
+        let dir = std::env::temp_dir().join("dartotsu_image_rust_test.jpg");
+        fs::write(&dir, jpeg(640, 480)).unwrap();
+        let path = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        let (mut p, mut len, mut w, mut h) = (ptr::null_mut(), 0usize, 0u32, 0u32);
+        let code = dartotsu_image_scale_file(path.as_ptr(), 320, 0, 3, &mut p, &mut len, &mut w, &mut h);
+        assert_eq!(code, OK);
+        assert_eq!((w, h, len), (320, 240, 320 * 240 * 4));
+        dartotsu_image_free(p, len);
+        let code = dartotsu_image_scale_file(path.as_ptr(), 4000, 0, 3, &mut p, &mut len, &mut w, &mut h);
+        assert_eq!(code, UNCHANGED);
+        let missing = std::ffi::CString::new("/nonexistent/x.jpg").unwrap();
+        assert_eq!(
+            dartotsu_image_scale_file(missing.as_ptr(), 100, 0, 3, &mut p, &mut len, &mut w, &mut h),
+            ERR_READ
+        );
+        let _ = fs::remove_file(dir);
+    }
 }
