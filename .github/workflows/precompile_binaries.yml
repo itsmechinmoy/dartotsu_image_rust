@@ -1,0 +1,44 @@
+name: Precompile binaries
+
+on:
+  push:
+    branches: [ci/prebuilt, main]
+    paths:
+      - rust/**
+      - cargokit/**
+      - .github/workflows/precompile_binaries.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  precompile:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x64-android, os: ubuntu-latest, android: true }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, android: false }
+          - { name: windows, os: windows-latest, android: false }
+          - { name: apple, os: macos-latest, android: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Precompile
+        shell: bash
+        working-directory: cargokit/build_tool
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.PRIVATE_KEY }}
+        run: |
+          ARGS="--manifest-dir=../../rust --repository=${{ github.repository }}"
+          if [ "${{ matrix.android }}" = "true" ]; then
+            NDK_VERSION=$(ls "$ANDROID_SDK_ROOT/ndk" | sort -V | tail -1)
+            ARGS="$ARGS --android-sdk-location=$ANDROID_SDK_ROOT --android-ndk-version=$NDK_VERSION --android-min-sdk-version=23"
+          fi
+          dart pub get
+          dart run build_tool precompile-binaries -v $ARGS
